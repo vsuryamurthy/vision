@@ -537,6 +537,7 @@ class SwinTransformer(nn.Module):
     ):
         super().__init__()
         _log_api_usage_once(self)
+        self.embed_dim = embed_dim
         self.num_classes = num_classes
 
         if block is None:

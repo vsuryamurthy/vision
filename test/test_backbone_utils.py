@@ -7,7 +7,7 @@ import torch
 from common_utils import set_rng_seed
 from torchvision import models
 from torchvision.models._utils import IntermediateLayerGetter
-from torchvision.models.detection.backbone_utils import BackboneWithFPN, mobilenet_backbone, resnet_fpn_backbone
+from torchvision.models.detection.backbone_utils import BackboneWithFPN, mobilenet_backbone, resnet_fpn_backbone, swin_fpn_backbone
 from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
 
 
@@ -39,6 +39,22 @@ def test_mobilenet_backbone(backbone_name):
     assert isinstance(model_fpn, BackboneWithFPN)
     model = mobilenet_backbone(backbone_name=backbone_name, weights=None, fpn=False)
     assert isinstance(model, torch.nn.Sequential)
+
+
+@pytest.mark.parametrize("backbone_name", ("swin_t", "swin_s", "swin_b", "swin_v2_t", "swin_v2_s", "swin_v2_b"))
+def test_swin_fpn_backbone(backbone_name):
+    x = torch.rand(1, 3, 300, 300, dtype=torch.float32, device="cpu")
+    model = swin_fpn_backbone(backbone_name=backbone_name, weights=None)
+    assert isinstance(model, BackboneWithFPN)
+    y = model(x)
+    assert list(y.keys()) == ["0", "1", "2", "3", "pool"]
+
+    with pytest.raises(ValueError, match=r"Trainable layers should be in the range"):
+        swin_fpn_backbone(backbone_name=backbone_name, weights=None, trainable_layers=9)
+    with pytest.raises(ValueError, match=r"Each returned layer should be in the range"):
+        swin_fpn_backbone(backbone_name=backbone_name, weights=None, returned_layers=[-1, 0, 1, 2])
+    with pytest.raises(ValueError, match=r"Each returned layer should be in the range"):
+        swin_fpn_backbone(backbone_name=backbone_name, weights=None, returned_layers=[6, 7, 8, 9])
 
 
 # Needed by TestFxFeatureExtraction.test_leaf_module_and_function

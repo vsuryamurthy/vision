@@ -1,11 +1,12 @@
 import warnings
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Union
 
 from torch import nn, Tensor
 from torchvision.ops import misc as misc_nn_ops
 from torchvision.ops.feature_pyramid_network import ExtraFPNBlock, FeaturePyramidNetwork, LastLevelMaxPool
 
-from .. import mobilenet, resnet
+from .. import mobilenet, resnet, swin_transformer
 from .._api import _get_enum_from_fn, WeightsEnum
 from .._utils import handle_legacy_interface, IntermediateLayerGetter
 
@@ -25,9 +26,13 @@ class BackboneWithFPN(nn.Module):
         in_channels_list (List[int]): number of channels for each feature map
             that is returned, in the order they are present in the OrderedDict
         out_channels (int): number of channels in the FPN.
-        norm_layer (callable, optional): Module specifying the normalization layer to use. Default: None
+        extra_blocks (ExtraFPNBlock or None): if provided, extra operations will
+            be performed. It is expected to take the fpn features, the original
+            features and the names of the original features as input, and returns
+            a new list of feature maps and their corresponding names.
+        norm_layer (callable, optional): Module specifying the normalization layer to use. Default: None.
     Attributes:
-        out_channels (int): the number of channels in the FPN
+        out_channels (int): the number of channels in the FPN.
     """
 
     def __init__(
@@ -55,6 +60,55 @@ class BackboneWithFPN(nn.Module):
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         x = self.body(x)
+        x = self.fpn(x)
+        return x
+
+
+class PermutedBackboneWithFPN(BackboneWithFPN):
+    """
+    Permutes the feature maps before adding a FPN on top of a model.
+    Args:
+        backbone (nn.Module)
+        return_layers (Dict[name, new_name]): a dict containing the names
+            of the modules for which the activations will be returned as
+            the key of the dict, and the value of the dict is the name
+            of the returned activation (which the user can specify).
+        in_channels_list (List[int]): number of channels for each feature map
+            that is returned, in the order they are present in the OrderedDict
+        out_channels (int): number of channels in the FPN.
+        extra_blocks (ExtraFPNBlock or None): if provided, extra operations will
+            be performed. It is expected to take the fpn features, the original
+            features and the names of the original features as input, and returns
+            a new list of feature maps and their corresponding names.
+        norm_layer (callable, optional): Module specifying the normalization layer to use. Default: None.
+    Attributes:
+        out_channels (int): the number of channels in the FPN.
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        return_layers: Dict[str, str],
+        in_channels_list: List[int],
+        out_channels: int,
+        extra_blocks: Optional[ExtraFPNBlock] = None,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__(
+            backbone,
+            return_layers,
+            in_channels_list,
+            out_channels,
+            extra_blocks,
+            norm_layer
+        )
+
+        # return_layers from swin model needs to be permuted before sending it to FPN.
+        self.permute = misc_nn_ops.Permute((0, 3, 1, 2))
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        x = self.body(x)
+        x = OrderedDict([(k, self.permute(v)) for k, v in x.items()])
         x = self.fpn(x)
         return x
 
@@ -169,7 +223,7 @@ def _validate_trainable_layers(
         trainable_backbone_layers = default_value
     if trainable_backbone_layers < 0 or trainable_backbone_layers > max_value:
         raise ValueError(
-            f"Trainable backbone layers should be in the range [0,{max_value}], got {trainable_backbone_layers} "
+            f"Trainable backbone layers should be in the range [0,{max_value}], got {trainable_backbone_layers}"
         )
     return trainable_backbone_layers
 
@@ -210,7 +264,7 @@ def _mobilenet_extractor(
 
     # find the index of the layer from which we wont freeze
     if trainable_layers < 0 or trainable_layers > num_stages:
-        raise ValueError(f"Trainable layers should be in the range [0,{num_stages}], got {trainable_layers} ")
+        raise ValueError(f"Trainable layers should be in the range [0, {num_stages}], got {trainable_layers}")
     freeze_before = len(backbone) if trainable_layers == 0 else stage_indices[num_stages - trainable_layers]
 
     for b in backbone[:freeze_before]:
@@ -225,7 +279,7 @@ def _mobilenet_extractor(
         if returned_layers is None:
             returned_layers = [num_stages - 2, num_stages - 1]
         if min(returned_layers) < 0 or max(returned_layers) >= num_stages:
-            raise ValueError(f"Each returned layer should be in the range [0,{num_stages - 1}], got {returned_layers} ")
+            raise ValueError(f"Each returned layer should be in the range [0, {num_stages - 1}], got {returned_layers}")
         return_layers = {f"{stage_indices[k]}": str(v) for v, k in enumerate(returned_layers)}
 
         in_channels_list = [backbone[stage_indices[i]].out_channels for i in returned_layers]
@@ -240,3 +294,79 @@ def _mobilenet_extractor(
         )
         m.out_channels = out_channels  # type: ignore[assignment]
         return m
+
+
+@handle_legacy_interface(
+    weights=(
+        "pretrained",
+        lambda kwargs: _get_enum_from_fn(swin_transformer.__dict__[kwargs["backbone_name"]]).from_str("DEFAULT"),
+    ),
+)
+def swin_fpn_backbone(
+    *,
+    backbone_name: str,
+    weights: Optional[WeightsEnum],
+    norm_layer: Callable[..., nn.Module] = misc_nn_ops.FrozenBatchNorm2d,
+    trainable_layers: int = 7,
+    returned_layers: Optional[List[int]] = None,
+    extra_blocks: Optional[ExtraFPNBlock] = None,
+) -> PermutedBackboneWithFPN:
+    """
+    Constructs a specified Swin Transformer backbone with FPN on top.
+
+    Args:
+        backbone_name (string): swin transformer architecture.
+            Possible values are 'swin_s', 'swin_t', 'swin_b', 'swin_v2_s', 'swin_v2_t'. swin_v2_b'.
+        weights (WeightsEnum, optional): The pretrained weights for the model.
+        norm_layer (callable): it is recommended to use the default value. For details visit:
+            (https://github.com/facebookresearch/maskrcnn-benchmark/issues/267)
+        trainable_layers (int): number of trainable (not frozen) layers starting from final block.
+            Valid values are between 0 and 8, with 8 meaning all backbone layers are trainable.
+        returned_layers (list of int): The layers of the network to return.
+        extra_blocks (ExtraFPNBlock or None): if provided, extra operations will
+            be performed. It is expected to take the fpn features, the original
+            features and the names of the original features as input, and returns
+            a new list of feature maps and their corresponding names. By
+            default a ``LastLevelMaxPool`` is used.
+    """
+    backbone = swin_transformer.__dict__[backbone_name](weights=weights)
+    return _swin_fpn_extractor(backbone, trainable_layers, returned_layers, extra_blocks)
+
+
+def _swin_fpn_extractor(
+    backbone: swin_transformer.SwinTransformer,
+    trainable_layers: int,
+    returned_layers: Optional[List[int]] = None,
+    extra_blocks: Optional[ExtraFPNBlock] = None,
+    norm_layer: Optional[Callable[..., nn.Module]] = None,
+) -> PermutedBackboneWithFPN:
+    embed_dim = backbone.embed_dim
+    backbone = backbone.features
+    num_stages = len(backbone)
+
+    # Find the index of the layer from which we wont freeze
+    if trainable_layers < 0 or trainable_layers > num_stages:
+        raise ValueError(f"Trainable layers should be in the range [0, {num_stages}], got {trainable_layers}")
+    freeze_before = num_stages - trainable_layers
+
+    for b in backbone[:freeze_before]:
+        for name, parameter in b.named_parameters():
+            parameter.requires_grad_(False)
+
+    if extra_blocks is None:
+        extra_blocks = LastLevelMaxPool()
+
+    # Return the 4 feature maps as default.
+    if returned_layers is None:
+        returned_layers = [1, 3, 5, 7]
+    if min(returned_layers) < 0 or max(returned_layers) >= num_stages:
+        raise ValueError(f"Each returned layer should be in the range [0, {num_stages - 1}]. Got {returned_layers}")
+    return_layers = {f"{k}": str(v) for v, k in enumerate(returned_layers)}
+
+    # Given that swin features are comprised of 8 layers, each sequential pair (Eg: layers 0 and 1, 1 and 2,..)
+    # have the same output dimension.
+    in_channels_list = [embed_dim * 2 ** (i // 2) for i in returned_layers]
+    out_channels = 96
+    return PermutedBackboneWithFPN(
+        backbone, return_layers, in_channels_list, out_channels, extra_blocks=extra_blocks, norm_layer=norm_layer
+    )
